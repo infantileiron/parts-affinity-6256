@@ -2,12 +2,15 @@ import os,json
 import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from src.config.database import db
-from src.models.entities import User,Job,MiningRun,AssociationRule,Kit,Audit
+from src.models.entities import User,Job,MiningRun,AssociationRule,Kit,Audit,Station,SummaryReport
 from src.schemas.business import Login,JobInput,RunInput,KitInput,KitEdit
+from src.schemas.summary import StationInput,SummaryInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
 from src.services.jobs import save_job
+from src.services.summaries import import_report,activate
+from src.services.sources import build_snapshot,reconcile
 from src.controllers.business import ensure_run,ensure_rule,ensure_kit
 router=APIRouter()
 @router.post('/auth/login')
@@ -25,17 +28,43 @@ def create_job(data:JobInput,u=Depends(editor),s=Depends(db)):
 @router.put('/jobs/{i}')
 def edit_job(i:int,data:JobInput,u=Depends(editor),s=Depends(db)):
  r=save_job(s,data,i);audit(s,u,'修订作业 '+str(i));return r
+@router.get('/stations')
+def stations(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Station).order_by(Station.id).all()]
+@router.post('/stations')
+def create_station(data:StationInput,u=Depends(editor),s=Depends(db)):
+ if s.query(Station).filter_by(code=data.code).first():raise HTTPException(409,'分站编码已存在')
+ r=Station(code=data.code,name=data.name);s.add(r);s.commit();audit(s,u,'登记分站 '+r.code);return dump(r)
+@router.get('/summaries')
+def summaries(station_code:str|None=None,cycle:str|None=None,u=Depends(current),s=Depends(db)):
+ q=s.query(SummaryReport)
+ if station_code:q=q.filter_by(station_code=station_code)
+ if cycle:q=q.filter_by(cycle=cycle)
+ return [dump(r) for r in q.order_by(SummaryReport.id.desc()).all()]
+@router.post('/summaries/import')
+def import_summary(data:SummaryInput,u=Depends(editor),s=Depends(db)):
+ r,deduplicated=import_report(s,data)
+ audit(s,u,('重复导入已幂等忽略 ' if deduplicated else '导入分站汇总 ')+str(r['id']))
+ return {**r,'deduplicated':deduplicated}
+@router.post('/summaries/{i}/activate')
+def activate_summary(i:int,u=Depends(editor),s=Depends(db)):
+ r=activate(s,i);audit(s,u,'汇总生效 %s/%s v%d'%(r['station_code'],r['cycle'],r['version']));return r
 @router.get('/runs')
 def runs(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(MiningRun).order_by(MiningRun.id.desc()).all()]
 @router.post('/runs')
 def run(data:RunInput,u=Depends(editor),s=Depends(db)):
- rows=[dump(r) for r in s.query(Job).order_by(Job.id).all() if data.equipment=='全部' or r.equipment==data.equipment]
- r=MiningRun(**data.model_dump(),result={'snapshot':rows});s.add(r);s.commit()
+ # 同事务冻结完整来源版本：只读取 active 汇总，pending 不参与，杜绝半份汇总
+ manifest,snapshot=build_snapshot(s,data)
+ if snapshot['total_n']<2:raise HTTPException(422,'有效作业数不足2，无法挖掘（当前 %d）'%snapshot['total_n'])
+ r=MiningRun(name=data.name,equipment=data.equipment,min_support=data.min_support,
+  min_confidence=data.min_confidence,min_lift=data.min_lift,state='queued',
+  result=None,source_manifest=manifest,snapshot=snapshot);s.add(r);s.commit()
  try:redis.Redis.from_url(os.environ['REDIS_URL']).rpush('affinity:runs',r.id)
  except redis.RedisError:r.state='failed';r.error='队列暂不可用，请恢复后新建挖掘';s.commit();raise HTTPException(503,r.error)
  audit(s,u,'提交挖掘 '+str(r.id));return dump(r)
 @router.get('/runs/{i}')
 def detail(i:int,u=Depends(current),s=Depends(db)):return dump(ensure_run(s,i))
+@router.get('/runs/{i}/reconciliation')
+def run_reconciliation(i:int,u=Depends(current),s=Depends(db)):return reconcile(s,ensure_run(s,i))
 @router.get('/rules')
 def rules(run_id:int,u=Depends(current),s=Depends(db)):
  ensure_run(s,run_id);return [dump(r) for r in s.query(AssociationRule).filter_by(run_id=run_id).order_by(AssociationRule.lift.desc()).all()]
@@ -50,16 +79,16 @@ def kits(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Kit)
 def kit(data:KitInput,u=Depends(editor),s=Depends(db)):
  rule=ensure_rule(s,data.rule_id)
  if ensure_run(s,rule.run_id).state!='done':raise HTTPException(409,'来源规则尚未完成')
- r=Kit(**data.model_dump(),parts=sorted(set(rule.antecedent+rule.consequent)));s.add(r);s.commit();audit(s,u,'起草备件包 '+str(r.id));return dump(r)
+ r=Kit(**data.model_dump(),parts=sorted(set(rule.antecedent+rule.consequent)));s.add(r);s.commit();audit(s,u,'起草备件包 '+str(r.id));return r
 @router.put('/kits/{i}')
 def edit_kit(i:int,data:KitEdit,u=Depends(editor),s=Depends(db)):
  r=ensure_kit(s,i)
  if r.status!='draft':raise HTTPException(409,'已签核备件包不可覆盖，需新建方案')
- r.name=data.name;r.note=data.note;s.commit();audit(s,u,'修改备件包 '+str(i));return dump(r)
+ r.name=data.name;r.note=data.note;s.commit();audit(s,u,'修改备件包 '+str(i));return r
 @router.post('/kits/{i}/approve')
 def approve(i:int,u=Depends(admin),s=Depends(db)):
  r=ensure_kit(s,i)
  if r.status!='draft':raise HTTPException(409,'已签核方案不可重复签核')
- r.status='approved';s.commit();audit(s,u,'签核备件包 '+str(i));return dump(r)
+ r.status='approved';s.commit();audit(s,u,'签核备件包 '+str(i));return r
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]
